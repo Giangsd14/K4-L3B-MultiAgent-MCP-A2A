@@ -151,6 +151,17 @@ day09 run
 day09 validate
 ```
 
+Để ghi bằng chứng MCP một lần và thử lại decision engine mà không gọi thêm tool:
+
+```bash
+day09 run --record-evidence evidence_snapshots/run-001
+day09 replay --evidence-dir evidence_snapshots/run-001 --output-root replay_runs/experiment-001
+```
+
+`replay` ghi output và trace riêng trong `replay_runs/`. Snapshot chỉ lưu nội bộ,
+không đưa vào submission ZIP. Nếu MCP không trả bằng chứng hợp lệ, `run` dừng và
+giữ nguyên output/trace trước đó.
+
 Kết quả được tạo tại:
 
 ```text

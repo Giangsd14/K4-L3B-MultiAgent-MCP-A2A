@@ -26,6 +26,8 @@ traces/*
 !traces/.gitkeep
 dist/*
 !dist/.gitkeep
+evidence_snapshots/
+replay_runs/
 *.zip
 *.log
 

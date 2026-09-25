@@ -4,7 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
-from .mcp_gateway import EvidenceGateway
+from .ports import EvidenceClient, UnrecordedEvidenceCall
 from .trace import TraceWriter
 
 
@@ -28,7 +28,7 @@ class CaseEvidence:
     audited call when a specialist later asks for the same evidence.
     """
 
-    def __init__(self, case_id: str, gateway: EvidenceGateway, trace: TraceWriter) -> None:
+    def __init__(self, case_id: str, gateway: EvidenceClient, trace: TraceWriter) -> None:
         self.case_id = case_id
         self.gateway = gateway
         self.trace = trace
@@ -66,6 +66,8 @@ class CaseEvidence:
                 data=response["data"],
                 evidence_ref=response["evidence_ref"],
             )
+        except UnrecordedEvidenceCall:
+            raise
         except Exception as exc:
             result = EvidenceResult(
                 tool_name=tool_name,

@@ -34,8 +34,11 @@ class CaseFacts:
     products: list[dict[str, Any]] = field(default_factory=list)
     sellers: list[dict[str, Any]] = field(default_factory=list)
     shipment: dict[str, Any] | None = None
+    shipment_raw: dict[str, Any] | None = None
     payment: dict[str, Any] | None = None
+    payment_raw: dict[str, Any] | None = None
     refund: dict[str, Any] | None = None
+    refund_raw: dict[str, Any] | None = None
     refund_source: str = "unavailable"
     policy: dict[str, Any] | None = None
     conflicts: list[dict[str, Any]] = field(default_factory=list)
@@ -97,6 +100,26 @@ def _amount(value: Any) -> Decimal:
         return Decimal(0)
 
 
+def _known_amount(value: Any) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    try:
+        amount = Decimal(str(value))
+        if amount.is_finite() and amount >= 0:
+            return amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, TypeError, ValueError):
+        pass
+    return None
+
+
+def _first_known_amount(record: dict[str, Any], *keys: str) -> Decimal | None:
+    for key in keys:
+        amount = _known_amount(record.get(key))
+        if amount is not None:
+            return amount
+    return None
+
+
 def _date(value: Any) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
@@ -113,6 +136,14 @@ def _event_time(event: dict[str, Any]) -> str:
         if isinstance(value, str):
             return value
     return ""
+
+
+def _latest_refund_events(refund: dict[str, Any] | None) -> list[dict[str, Any]]:
+    latest_by_ref: dict[str, dict[str, Any]] = {}
+    for index, event in enumerate(sorted(_records(_dict(refund).get("events")), key=_event_time)):
+        refund_id = event.get("refund_id") or event.get("refund_reference") or event.get("id")
+        latest_by_ref[str(refund_id) if refund_id else f"event-{index}"] = event
+    return list(latest_by_ref.values())
 
 
 def _shipment_finding(facts: CaseFacts, seller_ids: list[str]) -> tuple[str, list[str], bool]:
@@ -158,33 +189,36 @@ def _payment_finding(
 
     payments = _records(facts.payment.get("payments"))
     events = _records(facts.payment.get("events"))
+    raw_payments = _records(_dict(facts.payment_raw).get("payments"))
+    duplicate_rows = _duplicate_payment_rows(raw_payments)
+    order_status = _dict(facts.order).get("order_status")
     if payments:
-        captured = sum(
-            (_amount(p.get("payment_value", p.get("amount_brl"))) for p in payments), Decimal(0)
+        amounts = [
+            _first_known_amount(payment, "payment_value", "amount_brl") for payment in payments
+        ]
+        captured = (
+            sum(amounts, Decimal(0)) if all(amount is not None for amount in amounts) else None
         )
     else:
         captures = [event for event in events if event.get("event_type") == "captured"]
+        capture_amounts = [_first_known_amount(event, "amount_brl") for event in captures]
         captured = (
-            sum((_amount(event.get("amount_brl")) for event in captures), Decimal(0))
-            if captures
+            sum(capture_amounts, Decimal(0))
+            if captures and all(amount is not None for amount in capture_amounts)
             else None
         )
 
     event_types = {event.get("event_type") for event in events}
-    refund_events = _records(_dict(facts.refund).get("events"))
-    latest_by_ref: dict[str, dict[str, Any]] = {}
-    for index, event in enumerate(sorted(refund_events, key=_event_time)):
-        refund_id = event.get("refund_id") or event.get("refund_reference") or event.get("id")
-        latest_by_ref[str(refund_id) if refund_id else f"event-{index}"] = event
-    latest = list(latest_by_ref.values())
+    latest = _latest_refund_events(facts.refund)
     confirmed = [
         event
         for event in latest
         if event.get("status") == "confirmed" or event.get("event_type") == "refunded"
     ]
+    refund_amounts = [_first_known_amount(event, "amount_brl") for event in confirmed]
     refunded = (
-        sum((_amount(event.get("amount_brl")) for event in confirmed), Decimal(0))
-        if facts.refund is not None
+        sum(refund_amounts, Decimal(0))
+        if facts.refund is not None and all(amount is not None for amount in refund_amounts)
         else None
     )
     outstanding = (
@@ -193,7 +227,15 @@ def _payment_finding(
         else None
     )
 
-    if "duplicate_charge" in event_types:
+    if duplicate_rows and order_status == "delivered":
+        raw_amounts = [
+            _first_known_amount(row, "payment_value", "amount_brl") for row in raw_payments
+        ]
+        if raw_amounts and all(amount is not None for amount in raw_amounts):
+            captured = sum(raw_amounts, Decimal(0))
+            outstanding = max(Decimal(0), captured - refunded) if refunded is not None else None
+
+    if "duplicate_charge" in event_types or (duplicate_rows and order_status == "delivered"):
         verdict = "duplicate_capture"
     elif "reconciliation_mismatch" in event_types:
         verdict = "capture_mismatch"
@@ -214,6 +256,24 @@ def _payment_finding(
     else:
         verdict = "reconciled"
     return verdict, captured, refunded, outstanding, payments
+
+
+def _duplicate_payment_rows(payments: list[dict[str, Any]]) -> bool:
+    seen: set[tuple[str, str, str, Decimal]] = set()
+    for payment in payments:
+        amount = _first_known_amount(payment, "payment_value", "amount_brl")
+        if amount is None:
+            continue
+        fingerprint = (
+            str(payment.get("payment_sequential", "")),
+            str(payment.get("payment_type", "")),
+            str(payment.get("payment_installments", "")),
+            amount,
+        )
+        if fingerprint in seen:
+            return True
+        seen.add(fingerprint)
+    return False
 
 
 def _primary_issue(
@@ -244,11 +304,9 @@ def _primary_issue(
     if order_status in {"canceled", "unavailable"} and outstanding is not None and outstanding > 0:
         return f"{order_status}_order_paid", 0.86
     if (
-        len(payments) > 1
+        "valid_split_payment" in claim_topics
+        and len(payments) > 1
         and payment_verdict == "reconciled"
-        and claim_topics.intersection(
-            {"valid_split_payment", "duplicate_charge", "payment_mismatch"}
-        )
     ):
         return "valid_split_payment", 0.78
     if facts.refund is None and claim_topics.intersection(
@@ -263,6 +321,8 @@ def _primary_issue(
         return "insufficient_evidence", 0.4
     if facts.order is None or facts.payment is None or facts.shipment is None:
         return "insufficient_evidence", 0.4
+    if len(payments) > 1 and payment_verdict == "reconciled":
+        return "valid_split_payment", 0.78
     return "unsupported_claim", 0.72
 
 
@@ -290,16 +350,75 @@ def _policy_decision(
     return status, action, refund, _records(rule.get("responsible_parties"))
 
 
-def _claim_refs(topic: str, evidence: CaseEvidence) -> list[str]:
+def _claim_refs(topic: str, issue: str, evidence: CaseEvidence) -> list[str]:
     if topic.startswith("late_delivery"):
         names = ["get_order", "get_shipment_summary", "get_sellers", "get_policy"]
+    elif topic == "requested_full_refund" and issue.startswith("late_delivery"):
+        names = ["get_order", "get_shipment_summary", "get_payment_timeline", "get_policy"]
+    elif topic == "requested_full_refund" and issue in {
+        "canceled_order_paid",
+        "unavailable_order_paid",
+    }:
+        names = [
+            "get_order",
+            "get_shipment_summary",
+            "get_payment_timeline",
+            "get_refund_timeline",
+            "get_policy",
+        ]
     elif topic in {"requested_full_refund", "refund_pending", "refund_failed"}:
         names = ["get_order", "get_payment_timeline", "get_refund_timeline", "get_policy"]
     elif topic in {"duplicate_charge", "payment_mismatch", "valid_split_payment"}:
-        names = ["get_order", "get_payment_timeline", "get_policy"]
+        names = ["get_order", "get_order_items", "get_payment_timeline", "get_policy"]
+    elif topic in {"canceled_order_paid", "unavailable_order_paid"}:
+        names = [
+            "get_order",
+            "get_shipment_summary",
+            "get_payment_timeline",
+            "get_refund_timeline",
+            "get_policy",
+        ]
     else:
-        names = ["get_customer_history", "get_order", "get_policy"]
+        names = ["get_order", "get_shipment_summary", "get_payment_timeline", "get_policy"]
     return evidence.refs_for(*names)[:20]
+
+
+def _supported_issues(
+    facts: CaseFacts,
+    shipment_verdict: str,
+    payment_verdict: str,
+    outstanding: Decimal | None,
+    payments: list[dict[str, Any]],
+) -> list[str]:
+    """Identify issues independently so a lower priority claim is still assessed fairly."""
+    issues: list[str] = []
+    order_status = _dict(facts.order).get("order_status") or _dict(facts.shipment).get(
+        "order_status"
+    )
+    if payment_verdict == "duplicate_capture":
+        issues.append("duplicate_charge")
+    if payment_verdict == "capture_mismatch":
+        issues.append("payment_mismatch")
+    latest = _latest_refund_events(facts.refund)
+    if any(
+        event.get("status") == "failed" or event.get("event_type") == "refund_failed"
+        for event in latest
+    ):
+        issues.append("refund_failed")
+    if any(
+        event.get("status") == "pending" or event.get("event_type") == "refund_pending"
+        for event in latest
+    ):
+        issues.append("refund_pending")
+    if shipment_verdict == "seller_delay":
+        issues.append("late_delivery_seller")
+    if shipment_verdict == "logistics_delay":
+        issues.append("late_delivery_logistics")
+    if order_status in {"canceled", "unavailable"} and outstanding is not None and outstanding > 0:
+        issues.append(f"{order_status}_order_paid")
+    if len(payments) > 1 and payment_verdict not in {"duplicate_capture", "capture_mismatch"}:
+        issues.append("valid_split_payment")
+    return issues
 
 
 def build_output(case: dict[str, Any], facts: CaseFacts, evidence: CaseEvidence) -> dict[str, Any]:
@@ -308,9 +427,28 @@ def build_output(case: dict[str, Any], facts: CaseFacts, evidence: CaseEvidence)
     seller_ids = _ids(facts.sellers + facts.items, "seller_id")
     shipment_verdict, late_seller_ids, timeline_complete = _shipment_finding(facts, seller_ids)
     payment_verdict, captured, refunded, outstanding, payments = _payment_finding(facts)
+    supported_issues = _supported_issues(
+        facts, shipment_verdict, payment_verdict, outstanding, payments
+    )
     issue, confidence = _primary_issue(
         facts, claim_topics, shipment_verdict, payment_verdict, captured, outstanding, payments
     )
+    first_topic = str(claims[0].get("topic", "")) if claims else ""
+    if (
+        facts.entity_status == "resolved"
+        and first_topic in supported_issues
+        and first_topic != "valid_split_payment"
+        and issue != first_topic
+    ):
+        issue = first_topic
+        confidence = 0.8
+    secondary_issues = [
+        supported
+        for supported in supported_issues
+        if supported != issue and supported != "valid_split_payment"
+    ][:10]
+    if issue != first_topic:
+        confidence = min(confidence, 0.7)
     refund_dependent_issue = issue in {
         "canceled_order_paid",
         "unavailable_order_paid",
@@ -358,7 +496,7 @@ def build_output(case: dict[str, Any], facts: CaseFacts, evidence: CaseEvidence)
     assessed_claims = []
     for claim in claims[:5]:
         topic = str(claim.get("topic", ""))
-        refs = _claim_refs(topic, evidence)
+        refs = _claim_refs(topic, issue, evidence)
         if not refs or issue == "insufficient_evidence":
             verdict = "insufficient_evidence"
         elif topic == "requested_full_refund":
@@ -370,7 +508,7 @@ def build_output(case: dict[str, Any], facts: CaseFacts, evidence: CaseEvidence)
                 verdict = "partially_supported"
             else:
                 verdict = "unsupported"
-        elif topic == issue:
+        elif topic in supported_issues or topic == issue:
             verdict = "supported"
         else:
             verdict = "unsupported"
@@ -392,19 +530,30 @@ def build_output(case: dict[str, Any], facts: CaseFacts, evidence: CaseEvidence)
         customer_id = case.get("customer_unique_id_hint")
     related_orders = _ids(_records(history.get("orders")), "order_id")
 
-    payment_refs = _payment_references(payments, _records(_dict(facts.payment).get("events")))
+    reference_payments = (
+        _records(_dict(facts.payment_raw).get("payments"))
+        if payment_verdict == "duplicate_capture" and facts.payment_raw is not None
+        else payments
+    )
+    payment_refs = _payment_references(
+        reference_payments, _records(_dict(facts.payment).get("events"))
+    )
     shipment = _dict(facts.shipment)
     shipment_refs = _shipment_references(shipment, facts.order_id)
     item_ids = _ids(facts.items, "order_item_id", "item_id")
     refund_float = float(refund)
     cause = ISSUE_TO_CAUSE[issue]
+    causal_issues = [
+        issue,
+        *(secondary for secondary in secondary_issues if secondary != "valid_split_payment"),
+    ][:5]
 
     return {
         "schema_version": "day09-l3b-output-v2",
         "case_id": case["case_id"],
         "assessment": {
             "primary_issue": issue,
-            "secondary_issues": [],
+            "secondary_issues": secondary_issues,
             "case_status": status,
             "confidence": confidence,
         },
@@ -438,7 +587,10 @@ def build_output(case: dict[str, Any], facts: CaseFacts, evidence: CaseEvidence)
             "refundable_total_brl": float(outstanding) if outstanding is not None else None,
         },
         "root_cause_analysis": {
-            "ranked_causes": [{"cause_code": cause, "rank": 1}],
+            "ranked_causes": [
+                {"cause_code": ISSUE_TO_CAUSE[supported], "rank": rank}
+                for rank, supported in enumerate(causal_issues, start=1)
+            ],
             "responsible_parties": formatted_parties[:5],
         },
         "evidence_refs": evidence.all_refs()[:30],

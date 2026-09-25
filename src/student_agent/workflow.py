@@ -5,8 +5,10 @@ from typing import Any
 
 from .decision import CaseFacts, build_output
 from .evidence import CaseEvidence, EvidenceResult
-from .mcp_gateway import EvidenceGateway
+from .ports import EvidenceClient
+from .temporal import normalize_temporal_facts
 from .trace import TraceWriter
+from .verifier import verify_semantics
 
 
 def _mapping(value: Any) -> dict[str, Any]:
@@ -112,6 +114,7 @@ async def _resolve_entity(
         )
     )
     valid: dict[str, dict[str, Any]] = {}
+    identity_conflict = False
     for candidate, response in zip(to_check, responses, strict=True):
         order = _mapping(response.data) if response.available else {}
         owner = order.get("customer_unique_id")
@@ -119,6 +122,7 @@ async def _resolve_entity(
         history_conflict = bool(
             history_ids and candidate not in history_ids and owner != customer_hint
         )
+        identity_conflict |= bool(order and (owner_conflict or history_conflict))
         if response.available and order and not owner_conflict and not history_conflict:
             valid[candidate] = order
         else:
@@ -156,7 +160,7 @@ async def _resolve_entity(
                 "resolution_code": "claimed_order_not_verified",
             }
         )
-    elif facts.rejected_candidates:
+    elif identity_conflict:
         selected_source = (
             "customer_history" if facts.customer_history is not None else "mcp_order_registry"
         )
@@ -263,6 +267,7 @@ async def _gather_specialist_evidence(
                 facts.refund = {"events": []}
                 facts.refund_source = absence
 
+    normalize_temporal_facts(facts)
     shipment_events = _rows(_mapping(facts.shipment).get("events"))
     seller_relevant = "late_delivery_seller" in topics or any(
         event.get("actor") == "seller" for event in shipment_events
@@ -307,6 +312,7 @@ def _verify_output(
         attributes={"task": "independent_verification"},
     )
     trace.contracts.validate_output(output, f"outputs/{case_id}.json")
+    verify_semantics(output, facts)
     audited = set(evidence.all_refs())
     if not set(output["evidence_refs"]).issubset(audited):
         raise ValueError(f"{case_id}: output references unaudited evidence")
@@ -345,7 +351,7 @@ def _verify_output(
 
 
 async def solve_case(
-    case: dict[str, Any], gateway: EvidenceGateway, trace: TraceWriter
+    case: dict[str, Any], gateway: EvidenceClient, trace: TraceWriter
 ) -> dict[str, Any]:
     """Investigate one case with case-scoped evidence and independent verification."""
     case_id = case["case_id"]

@@ -4,9 +4,13 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from student_agent.contracts import Contracts
+from student_agent.decision import CaseFacts
 from student_agent.evidence import CaseEvidence
 from student_agent.trace import TraceWriter
+from student_agent.verifier import verify_semantics
 from student_agent.workflow import solve_case
 
 
@@ -122,14 +126,7 @@ def test_customer_history_prunes_unrelated_candidate_and_split_is_not_duplicate(
     assert output["claim_assessments"][0]["verdict"] == "unsupported"
     assert output["affected_entities"]["payment_references"] == ["payment-1", "payment-2"]
     assert output["affected_entities"]["shipment_ids"] == ["ship-order-1"]
-    assert output["data_conflicts"] == [
-        {
-            "field": "order_id",
-            "sources": ["candidate_list", "customer_history"],
-            "selected_source": "customer_history",
-            "resolution_code": "unresolvable_candidate_rejected",
-        }
-    ]
+    assert output["data_conflicts"] == []
 
 
 def test_missing_timelines_do_not_become_reconciled_or_on_time(tmp_path: Path) -> None:
@@ -147,6 +144,15 @@ def test_missing_timelines_do_not_become_reconciled_or_on_time(tmp_path: Path) -
     assert sum(name == "get_payment_timeline" for name, _ in gateway.calls) == 1
 
 
+def test_payment_row_without_amount_does_not_become_zero_capture(tmp_path: Path) -> None:
+    data = responses()
+    data["get_payment_timeline"]["payments"] = [{"payment_reference": "payment-1"}]
+    output = run_case(tmp_path, case(), FakeGateway(data))
+
+    assert output["payment_analysis"]["captured_total_brl"] is None
+    assert output["payment_analysis"]["verdict"] == "insufficient_evidence"
+
+
 def test_seller_delay_uses_seller_evidence_and_claim_specific_refs(tmp_path: Path) -> None:
     data = responses()
     data["get_shipment_summary"]["events"] = [
@@ -159,6 +165,13 @@ def test_seller_delay_uses_seller_evidence_and_claim_specific_refs(tmp_path: Pat
     assert output["shipment_analysis"]["late_seller_ids"] == ["seller-1"]
     assert sum(name == "get_sellers" for name, _ in gateway.calls) == 1
     assert len(output["claim_assessments"][0]["evidence_refs"]) < len(output["evidence_refs"])
+    assert (
+        len(
+            set(output["claim_assessments"][0]["evidence_refs"])
+            & set(output["claim_assessments"][1]["evidence_refs"])
+        )
+        >= 3
+    )
 
 
 def test_refunds_sum_distinct_confirmed_transactions(tmp_path: Path) -> None:
@@ -324,3 +337,65 @@ def test_explicit_seller_delay_precedes_canceled_status(tmp_path: Path) -> None:
     output = run_case(tmp_path, case("late_delivery_seller"), FakeGateway(data))
 
     assert output["assessment"]["primary_issue"] == "late_delivery_seller"
+
+
+def test_item_total_difference_is_not_a_payment_mismatch(tmp_path: Path) -> None:
+    data = responses()
+    data["get_order_items"] = [
+        {"order_item_id": 1, "seller_id": "seller-1", "price": 90, "freight_value": 10}
+    ]
+    data["get_payment_timeline"]["payments"] = [
+        {"payment_reference": "payment-1", "payment_value": 100},
+        {"payment_reference": "payment-2", "payment_value": 100},
+    ]
+    output = run_case(tmp_path, case("valid_split_payment"), FakeGateway(data))
+
+    assert output["payment_analysis"]["verdict"] == "reconciled"
+    assert output["assessment"]["primary_issue"] == "valid_split_payment"
+    assert output["claim_assessments"][0]["verdict"] == "supported"
+
+
+def test_semantic_verifier_rejects_unbacked_payment_mismatch(tmp_path: Path) -> None:
+    output = run_case(tmp_path, case(), FakeGateway(responses()))
+    output["payment_analysis"]["verdict"] = "capture_mismatch"
+
+    with pytest.raises(ValueError, match="lacks payment-timeline evidence"):
+        verify_semantics(output, CaseFacts(payment={"events": []}))
+
+
+def test_normal_split_is_not_a_secondary_issue_for_failed_refund(tmp_path: Path) -> None:
+    data = responses()
+    data["get_refund_timeline"] = {
+        "events": [{"refund_id": "r1", "status": "failed", "amount_brl": 20}]
+    }
+    output = run_case(tmp_path, case("valid_split_payment"), FakeGateway(data))
+
+    assert output["assessment"]["primary_issue"] == "refund_failed"
+    assert "valid_split_payment" not in output["assessment"]["secondary_issues"]
+    assert output["claim_assessments"][0]["verdict"] == "supported"
+
+
+def test_claimed_refund_pending_is_not_masked_by_payment_mismatch(tmp_path: Path) -> None:
+    data = responses()
+    data["get_payment_timeline"]["events"] = [{"event_type": "reconciliation_mismatch"}]
+    data["get_refund_timeline"] = {
+        "events": [{"refund_id": "r1", "status": "pending", "amount_brl": 20}]
+    }
+    output = run_case(tmp_path, case("refund_pending"), FakeGateway(data))
+
+    assert output["assessment"]["primary_issue"] == "refund_pending"
+    assert "payment_mismatch" in output["assessment"]["secondary_issues"]
+    assert output["claim_assessments"][0]["verdict"] == "supported"
+
+
+def test_authoritative_customer_disagreement_is_a_real_conflict(tmp_path: Path) -> None:
+    data = responses()
+    data["get_customer_history"]["orders"].append({"order_id": "unrelated-order"})
+    data["get_order"]["unrelated-order"] = {
+        "order_id": "unrelated-order",
+        "customer_unique_id": "another-customer",
+    }
+    output = run_case(tmp_path, case(), FakeGateway(data))
+
+    assert output["entity_resolution"]["rejected_candidates"] == ["unrelated-order"]
+    assert output["data_conflicts"][0]["resolution_code"] == "unresolvable_candidate_rejected"

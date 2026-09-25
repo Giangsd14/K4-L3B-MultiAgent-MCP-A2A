@@ -21,11 +21,14 @@ Input Case (JSON)
        │
    (handoff)
        ▼
+[Temporal Fact Normalizer] ──(purchase/approval/delivery anchored record cohorts)
+       │
+       ▼
 [Decision Engine] ──(MCP: get_policy; deterministic rules over normalized facts)
        │
    (handoff)
        ▼
-[Verifier Agent] ──(Schema & Invariants Validation)
+[Verifier Agent] ──(Schema, source-level semantics & invariants)
        │
    (case_finalized)
        ▼
@@ -66,7 +69,12 @@ Output JSON (outputs/<case_id>.json) & Trace (traces/trace.jsonl)
 2. **Consumption Tracking**:
    - Mỗi lần agent sử dụng dữ liệu từ tool, một event `tool_result_consumed` được phát ra trong trace gắn kèm `evidence_refs` tương ứng.
 3. **Data Conflict Resolution**:
-   - Ghi `data_conflicts` khi candidate list chứa order bị customer history hoặc order registry loại; cũng ghi khi claimed order khác customer history hoặc order status khác shipment status.
+   - Candidate không tồn tại chỉ được đưa vào `rejected_candidates`. Ghi `data_conflicts` khi hai nguồn đã quan sát bất đồng về chủ sở hữu, claimed order hoặc order status; không coi một candidate bị loại là xung đột nguồn.
+   - Đánh giá từng claim từ fact tương ứng, độc lập với thứ tự ưu tiên của `primary_issue`. Các issue có bằng chứng nhưng không được chọn làm issue chính được ghi vào `secondary_issues`.
+   - Tách payment rows theo chuỗi `payment_sequential`: chuỗi mới bắt đầu khi sequence quay lại `1`. Ghép cohort đầu với các capture events; giữ raw timeline riêng để xác minh capture lặp.
+   - Đối chiếu sự kiện shipment với ngày mua và ngày giao thật. Một `delivered_late` không thể thuộc đơn đã hủy/chưa giao hoặc xảy ra trước khi mua.
+   - Gắn refund event với capture cohort tương ứng; sự kiện hoàn tiền gắn với khoản capture chỉ có ở cohort khác không được dùng để kết luận claim hiện tại.
+   - Chỉ kết luận reconciliation mismatch khi payment timeline có sự kiện authoritative tương ứng. Duplicate capture được nhận diện từ sự kiện authoritative hoặc các payment rows trùng đầy đủ sequence, method, installments và amount. Giá hàng cộng phí vận chuyển không được xem là mốc đối soát thanh toán nếu contract nguồn chưa xác nhận cùng cơ sở tính.
 
 ## 5. Failure and efficiency policy
 
@@ -91,10 +99,13 @@ Trước khi finalize case output, Verifier Agent kiểm tra các bất biến s
 5. **Financial Balance**: Tổng `refund_lines` bằng `recommended_refund_brl`, và đề xuất không vượt `refundable_total_brl` khi con số này xác định được.
 6. **Policy Consistency**: `case_status` và `resolution_actions` khớp rule MCP của `primary_issue` khi rule tồn tại.
 7. **Calibration Bounds**: `confidence` phải nằm trong khoảng $[0.0, 1.0]$; cần hiệu chỉnh tiếp bằng nhãn đánh giá nếu có.
+8. **Independent Semantic Check**: Verifier đối chiếu các verdict tác động lớn với tín hiệu gốc trong timeline; ví dụ `capture_mismatch` phải có sự kiện `reconciliation_mismatch`, còn `duplicate_capture` phải có sự kiện explicit hoặc các payment rows trùng fingerprint.
 
 ## 7. Reproducibility
 
 - **Decision engine**: deterministic rules trên fact từ MCP. `LLMClient` không tham gia luồng hiện tại.
+- **Evidence journal**: `run --record-evidence` lưu full MCP envelope và lỗi theo case, ngoài gói nộp. `replay` dùng lại chính bằng chứng đó để kiểm thử thay đổi decision/verifier mà không tạo thêm MCP call hay dùng evidence ref mới. Replay thiếu call sẽ dừng, không âm thầm coi như bằng chứng vắng mặt.
+- **Transactional run**: Output và trace được ghi vào thư mục tạm rồi mới công bố sau khi toàn bộ case chạy thành công. Nếu MCP không trả bằng chứng dùng được, run dừng sớm và giữ nguyên artifact trước đó.
 - **Python Version**: Python 3.11+.
 - **Dependencies**: `httpx2>=2,<3`, `mcp>=2,<3`, `jsonschema>=4.25`, `python-dotenv>=1.1`.
 - **Lệnh chạy toàn bộ**:
