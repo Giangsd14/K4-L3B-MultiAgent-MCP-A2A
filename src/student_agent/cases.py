@@ -20,6 +20,8 @@ class CaseSet:
 
 
 def _object(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise ValueError(f"{path}: required JSON file is missing")
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -31,7 +33,15 @@ def _object(path: Path) -> dict[str, Any]:
 
 def load_case_set(root: Path, expected_count: int = 100) -> CaseSet:
     root = root.resolve()
-    manifest = _object(root / "case-set.json")
+    manifest_path = root / "case-set.json"
+    input_root = root / "inputs"
+    if not manifest_path.is_file() and (input_root / "case-set.json").is_file():
+        manifest_path = input_root / "case-set.json"
+        nested_inputs = input_root / "inputs"
+        if nested_inputs.is_dir():
+            input_root = nested_inputs
+
+    manifest = _object(manifest_path)
     if set(manifest) != {"case_set_version", "variant_id", "case_ids"}:
         raise ValueError("case-set.json has unexpected or missing fields")
     if manifest["variant_id"] != VARIANT_ID:
@@ -47,7 +57,6 @@ def load_case_set(root: Path, expected_count: int = 100) -> CaseSet:
     if not isinstance(version, str) or not version:
         raise ValueError("case_set_version must be a non-empty string")
 
-    input_root = root / "inputs"
     actual_files = {path.stem: path for path in input_root.glob("*.json") if path.is_file()}
     if set(actual_files) != set(raw_ids):
         missing = sorted(set(raw_ids) - set(actual_files))
