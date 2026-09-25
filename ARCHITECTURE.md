@@ -15,13 +15,13 @@ Input Case (JSON)
        │                                 (handoff)
        ▼                                     ▼
 [Specialist Agents] ◄────────────────────────┘
-  ├── [Order Agent]    ──(MCP: get_order_items, get_product_context, get_sellers)
+  ├── [Order Agent]    ──(MCP: get_order_items, get_product_context; get_sellers khi cần)
   ├── [Shipment Agent] ──(MCP: get_shipment_summary)
   └── [Payment Agent]  ──(MCP: get_payment_timeline, get_refund_timeline)
        │
    (handoff)
        ▼
-[Policy & Conflict Agent] ──(MCP: get_policy, LLM: gpt-4o-mini reasoning)
+[Decision Engine] ──(MCP: get_policy; deterministic rules over normalized facts)
        │
    (handoff)
        ▼
@@ -37,23 +37,23 @@ Output JSON (outputs/<case_id>.json) & Trace (traces/trace.jsonl)
 | Actor | Input | Trách nhiệm | Tool permission | Output/handoff |
 | --- | --- | --- | --- | --- |
 | `coordinator` | `case.json` | Khởi tạo phiên điều tra, phân bổ task, điều phối vòng đời workflow và finalize case | Không gọi trực tiếp MCP data tool | Giao việc cho `entity_agent`, quản lý trace lifecycle |
-| `entity_agent` | `candidate_order_ids`, `customer_unique_id_hint` | Xác thực candidate orders, trích xuất lịch sử khách hàng, loại bỏ candidate giả lập/sai | `get_customer_history`, `get_order` | `resolved_order_ids`, `rejected_candidates`, handoff sang `order_agent` |
-| `order_agent` | `resolved_order_id`, `investigation_scope` | Trích xuất items, sellers, và bối cảnh phân loại sản phẩm | `get_order_items`, `get_product_context`, `get_sellers` | `item_ids`, `seller_ids`, category context, handoff sang `shipment_agent` |
+| `entity_agent` | `candidate_order_ids`, `customer_unique_id_hint` | Đối chiếu customer history, kiểm chứng order, giữ trạng thái ambiguous khi có nhiều order hợp lệ | `get_customer_history`, `get_order` | `resolved_order_ids`, `rejected_candidates`, handoff sang specialist hoặc policy |
+| `order_agent` | `resolved_order_id`, `investigation_scope` | Trích xuất items và product context; chỉ tra seller khi cần xác định trách nhiệm hoặc items thiếu seller ID | `get_order_items`, `get_product_context`, `get_sellers` | `item_ids`, `seller_ids`, handoff sang `shipment_agent` |
 | `shipment_agent` | `resolved_order_id` | Phân tích mốc thời gian giao hàng, trễ hạn seller vs logistics, xác định trách nhiệm chậm trễ | `get_shipment_summary` | `shipment_analysis` (verdict, late_seller_ids, timeline_complete), handoff sang `payment_agent` |
 | `payment_agent` | `resolved_order_id` | Phân tích dòng tiền, sự kiện capture, đối soát thanh toán, và vòng đời hoàn tiền | `get_payment_timeline`, `get_refund_timeline` | `payment_analysis` (verdict, captured_total_brl, refunded_total_brl), handoff sang `policy_agent` |
-| `policy_agent` | `policy_version`, toàn bộ evidence đã thu thập | Đối chiếu quy định chính sách (`EC_POLICY_V2`), xác định primary issue, case status, phân bổ trách nhiệm và hạn mức bồi hoàn | `get_policy` | Quyết định chính sách (`policy_decided`), root cause, financial resolution, handoff sang `verifier` |
-| `verifier` | Toàn bộ payload output & trace | Kiểm định độc lập: JSON schema compliance, toàn vẹn evidence refs, tính nhất quán tài chính và quan hệ thực thể | Không gọi tool | `verification_completed` (status: passed) |
+| `policy_agent` | `policy_version`, các fact đã chuẩn hoá | Xác định issue từ bằng chứng, áp dụng rule của `EC_POLICY_V2`, tính số tiền dựa trên payment/refund đã xác minh | `get_policy` | `policy_decided`, root cause, financial resolution, handoff sang `verifier` |
+| `verifier` | Output và evidence registry của case | Kiểm tra schema, quyền sở hữu evidence refs, quan hệ thực thể và cân bằng refund | Không gọi tool | `verification_completed` (status: passed) |
 
 Áp dụng nguyên tắc Least Privilege: mỗi agent chỉ có quyền gọi các MCP tool thuộc phạm vi trách nhiệm của mình.
 
 ## 3. Entity resolution và A2A protocol
 
 1. **Candidate Validation & Filtering**:
-   - Đối chiếu danh sách `candidate_order_ids` qua MCP tool `get_order`. Candidate không tồn tại trong hệ thống (lỗi MCP 404/not found) được phân loại vào `rejected_candidates`.
-   - Kết hợp tra cứu `get_customer_history` bằng `customer_unique_id_hint` để đối chiếu các order thực sự thuộc về khách hàng khiếu nại.
+   - Lấy `get_customer_history` trước để loại candidate không thuộc khách hàng mà không cần `get_order` riêng cho từng candidate.
+   - Gọi `get_order` cho claimed order và các candidate còn có khả năng đúng. Nếu nhiều order hợp lệ, giữ `ambiguous` thay vì chọn order đầu tiên.
 2. **Confidence Scoring**:
-   - Gán `confidence = 1.0` khi tìm thấy chính xác duy nhất 1 order hợp lệ khớp với `claimed_order_id` và customer history.
-   - Gán `confidence = 0.9` nếu không tìm thấy order hợp lệ (`status = "not_found"`).
+   - Entity confidence là `1.0` khi claimed order được cả order record và customer history xác nhận; giảm khi chỉ có một nguồn hoặc không thể resolve.
+   - Assessment confidence phụ thuộc loại bằng chứng và độ đầy đủ của policy; không cố định ở `0.95`.
 3. **Correlation & Message Envelope**:
    - Mọi message và trace event đều gắn `case_id` và `event_id` theo chuẩn `evt_[A-Za-z0-9_-]{12,96}`.
    - Luồng handoff tuần tự, xác định rõ actor nguồn và actor đích, không tạo vòng lặp.
@@ -61,43 +61,42 @@ Output JSON (outputs/<case_id>.json) & Trace (traces/trace.jsonl)
 ## 4. Evidence và conflict lifecycle
 
 1. **Validation & Registration**:
-   - Mọi phản hồi từ MCP tool đều được kiểm tra theo schema `day09-mcp-evidence-v1`.
-   - `evidence_ref` hợp lệ dạng `ev_[A-Za-z0-9_-]{20,96}` được lưu vào `InvestigationState` và chỉ sử dụng trong phạm vi case hiện tại.
+   - `EvidenceGateway` kiểm tra phản hồi theo schema `day09-mcp-evidence-v1`; `CaseEvidence` lưu kết quả theo `(tool, arguments)` trong phạm vi case, gồm cả lookup thất bại.
+   - Chỉ dùng `evidence_ref` do MCP trả về. Claim assessment chọn refs theo domain của claim.
 2. **Consumption Tracking**:
    - Mỗi lần agent sử dụng dữ liệu từ tool, một event `tool_result_consumed` được phát ra trong trace gắn kèm `evidence_refs` tương ứng.
 3. **Data Conflict Resolution**:
-   - Khi có sự sai lệch giữa thông tin ứng viên khai báo và thực tế tra cứu từ cơ sở dữ liệu MCP, một record trong `data_conflicts` được ghi nhận với `sources=["candidate_list", "mcp_order_registry"]` và `selected_source="mcp_order_registry"`.
+   - Ghi `data_conflicts` khi candidate list chứa order bị customer history hoặc order registry loại; cũng ghi khi claimed order khác customer history hoặc order status khác shipment status.
 
 ## 5. Failure and efficiency policy
 
 | Failure | Retry budget | Fallback | Trace event/code |
 | --- | ---: | --- | --- |
-| MCP timeout / network error | 2 retries | Ghi nhận thiếu bằng chứng, chuyển sang đánh giá fallback an toàn | `mcp_error` |
-| Entity not found / candidate invalid | 0 retries | Đưa vào `rejected_candidates`, set status `not_found` | `unresolvable_candidate_rejected` |
-| Refund timeline unavailable (404) | 0 retries | Coi như chưa có hoàn tiền (`refunded_total = 0.0`) | `refund_not_found` |
-| Invalid specialist result | 1 retry | Phân tích theo thông tin tối thiểu thu thập được từ order summary | `specialist_fallback` |
+| MCP timeout / network error | 0 retries trong cùng case | Ghi nhận thiếu bằng chứng; không chuyển thành verdict chắc chắn | Không tạo event giả |
+| Entity not found / candidate invalid | 0 retries | Đưa vào `rejected_candidates`; giữ `ambiguous` hoặc `not_found` theo số ứng viên hợp lệ | Handoff có `entity_status` |
+| Refund timeline không có bản ghi | 0 retries | Phân biệt `not_found`, suy ra vắng bản ghi từ lỗi ứng dụng + payment timeline, và lỗi kết nối; giảm confidence khi phải suy ra | Không tạo evidence ref giả |
 
 * **Query Budget & Efficiency**:
-  - Không gọi lại tool đã gọi với cùng tham số trong 1 case (in-memory per-case caching).
-  - Không quét ngẫu nhiên các order_id không nằm trong candidate list.
-  - Số lượng tool call trung bình mỗi case được tối ưu ở mức 5–8 calls, đảm bảo đạt điểm tối đa ở tiêu chí `efficiency`.
+  - Cache cả kết quả thành công và thất bại trong một case; các request đồng thời cùng key dùng chung một call.
+  - Customer history giúp tránh gọi order không liên quan; seller/refund chỉ được tra khi case cần.
+  - Số call thực tế cần được đo bằng MCP audit. Không giả định private call budget.
 
 ## 6. Verification invariants
 
 Trước khi finalize case output, Verifier Agent kiểm tra các bất biến sau:
 1. **Schema Invariant**: Output tuân thủ 100% `day09-l3b-output-v2.schema.json`.
-2. **Entity Scope**: `affected_entities` chứa đầy đủ order_ids, item_ids, seller_ids, payment_references, shipment_ids không trùng lặp.
+2. **Entity Scope**: Ưu tiên ID có trong dữ liệu MCP. Nếu payment row hoặc shipment summary không có ID riêng, tạo tham chiếu nội bộ ổn định `pay-{n}` hoặc `ship-{order-prefix}` cho bản ghi đã quan sát; không tạo tham chiếu khi thiếu bản ghi.
 3. **Rejected Candidates**: Hợp của `resolved_order_ids` và `rejected_candidates` bao phủ toàn bộ `candidate_order_ids`.
-4. **Evidence Ownership**: Toàn bộ `evidence_refs` trong output và trace đều xuất phát từ MCP tool calls của chính case đó trong cùng phiên chạy.
-5. **Financial Balance**: Nếu `recommended_refund_brl > 0`, tổng số tiền các dòng trong `refund_lines` phải bằng chính xác `recommended_refund_brl`. Nếu `recommended_refund_brl == 0`, `refund_lines` phải rỗng.
-6. **Policy Precedence**: `primary_issue`, `case_status`, và `resolution_actions` phải nhất quán với quy định trong `EC_POLICY_V2`.
-7. **Calibration Bounds**: `confidence` phải nằm trong khoảng $[0.0, 1.0]$.
+4. **Evidence Ownership**: Mọi `evidence_ref` trong output và từng claim phải thuộc registry của case hiện tại.
+5. **Financial Balance**: Tổng `refund_lines` bằng `recommended_refund_brl`, và đề xuất không vượt `refundable_total_brl` khi con số này xác định được.
+6. **Policy Consistency**: `case_status` và `resolution_actions` khớp rule MCP của `primary_issue` khi rule tồn tại.
+7. **Calibration Bounds**: `confidence` phải nằm trong khoảng $[0.0, 1.0]$; cần hiệu chỉnh tiếp bằng nhãn đánh giá nếu có.
 
 ## 7. Reproducibility
 
-- **Model**: `gpt-4o-mini` (qua OpenAI API) với `temperature = 0.0`.
+- **Decision engine**: deterministic rules trên fact từ MCP. `LLMClient` không tham gia luồng hiện tại.
 - **Python Version**: Python 3.11+.
-- **Dependencies**: `openai>=1.0`, `httpx2>=2,<3`, `mcp>=2,<3`, `jsonschema>=4.25`, `python-dotenv>=1.1`.
+- **Dependencies**: `httpx2>=2,<3`, `mcp>=2,<3`, `jsonschema>=4.25`, `python-dotenv>=1.1`.
 - **Lệnh chạy toàn bộ**:
   ```bash
   day09 run
