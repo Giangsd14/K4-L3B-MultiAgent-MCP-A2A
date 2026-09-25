@@ -90,14 +90,6 @@ class MultiAgentCoordinator:
 
         self.trace.emit(
             case_id=case_id,
-            event_type="policy_decided",
-            actor=self.conflict_resolver.name,
-            decision_code=conflict_result.get("primary_issue", "insufficient_evidence"),
-            attributes={"primary_issue": conflict_result.get("primary_issue")},
-        )
-
-        self.trace.emit(
-            case_id=case_id,
             event_type="handoff",
             actor=self.conflict_resolver.name,
             target=self.verifier.name,
