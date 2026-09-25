@@ -185,6 +185,65 @@ def reconcile_claim_episode(case: dict[str, Any], facts: CaseFacts) -> None:
     ):
         return
 
+    if topic in {"late_delivery_seller", "late_delivery_logistics"}:
+        actor = "seller" if topic == "late_delivery_seller" else "logistics_provider"
+        late_events = [
+            event
+            for event in _rows((facts.shipment or {}).get("events"))
+            if event.get("event_type") == "delivered_late" and event.get("actor") == actor
+        ]
+        matches = [
+            row
+            for row in candidates
+            if (delivered := _time(row.get("order_delivered_customer_date"))) is not None
+            and (estimated := _time(row.get("order_estimated_delivery_date"))) is not None
+            and delivered > estimated
+            and any(
+                (when := _event_time(event)) is not None
+                and abs(when - delivered) <= timedelta(days=1)
+                for event in late_events
+            )
+        ]
+        if len(matches) == 1:
+            purchase = _time(matches[0].get("order_purchase_timestamp"))
+            captures = _captures_near(facts.payment, purchase) if purchase else []
+            if captures:
+                _apply_episode(facts, matches[0], captures)
+        return
+
+    if topic == "refund_pending":
+        pending = [
+            event
+            for event in _rows((facts.refund or {}).get("events"))
+            if event.get("status") == "pending" or event.get("event_type") == "refund_pending"
+        ]
+        if len(pending) != 1:
+            return
+        amount = _money(pending[0].get("amount_brl"))
+        matched_captures = [
+            event
+            for event in _rows(facts.payment.get("events"))
+            if event.get("event_type") == "captured"
+            and amount is not None
+            and _money(event.get("amount_brl")) == amount
+        ]
+        if len(matched_captures) != 1:
+            return
+        capture_time = _event_time(matched_captures[0])
+        matches = [
+            row
+            for row in candidates
+            if capture_time is not None
+            and (purchase := _time(row.get("order_purchase_timestamp"))) is not None
+            and timedelta(0) <= capture_time - purchase <= timedelta(days=1)
+        ]
+        if len(matches) == 1:
+            purchase = _time(matches[0].get("order_purchase_timestamp"))
+            captures = _captures_near(facts.payment, purchase) if purchase else []
+            if len(captures) == 1:
+                _apply_episode(facts, matches[0], captures)
+        return
+
     if topic == "valid_split_payment":
         captures = _split_captures(facts.payment)
         if not captures:

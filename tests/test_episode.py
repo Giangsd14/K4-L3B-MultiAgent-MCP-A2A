@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
+
 from student_agent.decision import CaseFacts, _payment_finding, _shipment_finding
 from student_agent.episode import reconcile_claim_episode
 
@@ -126,3 +128,80 @@ def test_canceled_episode_excludes_other_purchase_delivery() -> None:
     assert facts.order["order_status"] == "canceled"
     assert _shipment_finding(facts, [])[0] == "insufficient_evidence"
     assert _payment_finding(facts)[1] == Decimal("79")
+
+
+@pytest.mark.parametrize(
+    ("topic", "actor", "expected_verdict", "late_amount"),
+    [
+        ("late_delivery_seller", "seller", "seller_delay", "18"),
+        ("late_delivery_logistics", "logistics_provider", "logistics_delay", "16"),
+    ],
+)
+def test_late_delivery_episode_excludes_other_purchase_payment(
+    topic: str, actor: str, expected_verdict: str, late_amount: str
+) -> None:
+    target = episode("2018-05-01T09:00:00-03:00", delivered="2018-05-14T09:00:00-03:00")
+    other = episode("2018-04-01T09:00:00-03:00", status="canceled")
+    facts = CaseFacts(
+        entity_status="resolved",
+        resolved_order_ids=["order-1"],
+        customer_history={"orders": [other, target]},
+        order=other,
+        shipment={
+            "order_status": "canceled",
+            "delivered_customer_at": None,
+            "events": [
+                {
+                    "event_type": "delivered_late",
+                    "actor": actor,
+                    "event_at": "2018-05-14T09:00:00-03:00",
+                }
+            ],
+        },
+        payment={
+            "payments": [{"payment_value": "79"}, {"payment_value": late_amount}],
+            "events": [
+                capture("79", "2018-04-01T10:00:00-03:00"),
+                capture(late_amount, "2018-05-01T10:00:00-03:00"),
+            ],
+        },
+        refund={"events": []},
+    )
+
+    reconcile_claim_episode(case(topic), facts)
+
+    assert facts.history_episode_selected
+    assert facts.order["order_status"] == "delivered"
+    assert _shipment_finding(facts, ["seller-1"])[0] == expected_verdict
+    assert _payment_finding(facts)[1] == Decimal(late_amount)
+
+
+def test_pending_refund_excludes_other_purchase_reconciliation_error() -> None:
+    other = episode("2018-04-01T09:00:00-03:00")
+    target = episode("2018-05-01T09:00:00-03:00")
+    facts = CaseFacts(
+        entity_status="resolved",
+        resolved_order_ids=["order-1"],
+        customer_history={"orders": [other, target]},
+        order=other,
+        payment={
+            "payments": [{"payment_value": "35"}, {"payment_value": "89"}],
+            "events": [
+                capture("35", "2018-04-01T10:00:00-03:00"),
+                {
+                    "event_type": "reconciliation_mismatch",
+                    "amount_brl": "35",
+                    "event_at": "2018-04-01T12:00:00-03:00",
+                },
+                capture("89", "2018-05-01T10:00:00-03:00"),
+            ],
+        },
+        refund={"events": [{"status": "pending", "amount_brl": "89"}]},
+    )
+
+    reconcile_claim_episode(case("refund_pending"), facts)
+
+    verdict, captured, _, _, _ = _payment_finding(facts)
+    assert facts.history_episode_selected
+    assert verdict == "refund_pending"
+    assert captured == Decimal("89")
