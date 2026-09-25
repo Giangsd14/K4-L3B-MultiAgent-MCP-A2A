@@ -409,6 +409,18 @@ def test_item_total_difference_is_not_a_payment_mismatch(tmp_path: Path) -> None
     assert output["claim_assessments"][0]["verdict"] == "supported"
 
 
+def test_unsupported_claim_stays_unsupported_when_primary_issue_matches(tmp_path: Path) -> None:
+    data = responses()
+    data["get_payment_timeline"]["payments"] = [
+        {"payment_reference": "payment-1", "payment_value": 100}
+    ]
+
+    output = run_case(tmp_path, case("unsupported_claim"), FakeGateway(data))
+
+    assert output["assessment"]["primary_issue"] == "unsupported_claim"
+    assert output["claim_assessments"][0]["verdict"] == "unsupported"
+
+
 def test_semantic_verifier_rejects_unbacked_payment_mismatch(tmp_path: Path) -> None:
     output = run_case(tmp_path, case(), FakeGateway(responses()))
     output["payment_analysis"]["verdict"] = "capture_mismatch"

@@ -39,6 +39,7 @@ class CaseFacts:
     refund_source: str = "unavailable"
     policy: dict[str, Any] | None = None
     conflicts: list[dict[str, Any]] = field(default_factory=list)
+    history_episode_selected: bool = False
 
     @property
     def order_id(self) -> str | None:
@@ -494,8 +495,12 @@ def build_output(case: dict[str, Any], facts: CaseFacts, evidence: CaseEvidence)
     for claim in claims[:5]:
         topic = str(claim.get("topic", ""))
         refs = _claim_refs(topic, issue, evidence)
+        if facts.history_episode_selected:
+            refs = list(dict.fromkeys([*evidence.refs_for("get_customer_history"), *refs]))[:20]
         if not refs or issue == "insufficient_evidence":
             verdict = "insufficient_evidence"
+        elif topic == "unsupported_claim":
+            verdict = "unsupported"
         elif topic == "requested_full_refund":
             if outstanding is None:
                 verdict = "insufficient_evidence"

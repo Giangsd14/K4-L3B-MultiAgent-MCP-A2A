@@ -4,6 +4,7 @@ import asyncio
 from typing import Any
 
 from .decision import CaseFacts, build_output
+from .episode import reconcile_claim_episode
 from .evidence import CaseEvidence, EvidenceResult
 from .ports import EvidenceClient
 from .trace import TraceWriter
@@ -266,6 +267,7 @@ async def _gather_specialist_evidence(
                 facts.refund = {"events": []}
                 facts.refund_source = absence
 
+    reconcile_claim_episode(case, facts)
     shipment_events = _rows(_mapping(facts.shipment).get("events"))
     seller_relevant = "late_delivery_seller" in topics or any(
         event.get("actor") == "seller" for event in shipment_events
