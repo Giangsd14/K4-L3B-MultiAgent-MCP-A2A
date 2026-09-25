@@ -5,7 +5,9 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
+from .base_agent import clear_case_cache
 from .cases import load_case_set
 from .config import Settings
 from .contracts import Contracts
@@ -47,21 +49,26 @@ async def _run(root: Path) -> None:
         async def call(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
             return {}
 
-    gateway = None
-    gw_ctx = None
-    try:
-        gw_ctx = connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts)
-        gateway = await gw_ctx.__aenter__()
-    except (Exception, BaseException):
-        gateway = OfflineGateway()
+    async def _solve_one_case(case: dict[str, Any]) -> dict[str, Any]:
+        """Solve a single case with its own MCP connection, retry once on failure."""
+        for attempt in range(2):
+            try:
+                async with connect_gateway(
+                    settings.mcp_endpoint, settings.team_api_key, contracts
+                ) as gw:
+                    return await solve_case(case, gw, trace)
+            except BaseException:
+                if attempt == 0:
+                    continue
+        # Both attempts failed — fall back to offline inference
+        return await solve_case(case, OfflineGateway(), trace)
 
     for case_id in case_set.case_ids:
         case = case_set.cases[case_id]
+        clear_case_cache(case_id)  # Ensure no stale cache from prior runs
         trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
-        try:
-            output = await solve_case(case, gateway, trace)
-        except (Exception, BaseException):
-            output = await solve_case(case, OfflineGateway(), trace)
+        output = await _solve_one_case(case)
+        clear_case_cache(case_id)  # Free memory after each case
 
         contracts.validate_output(output, f"outputs/{case_id}.json")
         if output.get("case_id") != case_id:
@@ -73,12 +80,6 @@ async def _run(root: Path) -> None:
         )
         temporary.replace(target)
         trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
-
-    if gw_ctx is not None and not isinstance(gateway, OfflineGateway):
-        try:
-            await gw_ctx.__aexit__(None, None, None)
-        except (Exception, BaseException):
-            pass
 
 
 def parser() -> argparse.ArgumentParser:

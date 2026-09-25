@@ -22,8 +22,9 @@ class ConflictResolverAgent(BaseAgent):
         payment_analysis = context.get("payment_analysis", {})
 
         # 1. Query policy via get_policy
+        policy_version = case.get("policy_version", "EC_POLICY_V2")
         try:
-            await self.call_tool("get_policy", case_id=case_id)
+            await self.call_tool("get_policy", case_id=case_id, policy_version=policy_version)
         except Exception:
             pass
 
@@ -39,11 +40,21 @@ class ConflictResolverAgent(BaseAgent):
         responsible_parties: list[dict[str, Any]] = []
 
         claim_topics = [c.get("topic", "") for c in claims]
+        # Filter out meta-topic "requested_full_refund" to get the actual complaint
+        substantive_topics = [t for t in claim_topics if t != "requested_full_refund"]
+        primary_claim_topic = substantive_topics[0] if substantive_topics else ""
 
-        # 2. Determine Primary Issue based on findings
+        # ─── PRIMARY ISSUE DETERMINATION ────────────────────────────────────────
+        # Decision hierarchy:
+        #   1. MCP evidence from payment specialist (highest authority)
+        #   2. MCP evidence from shipment specialist
+        #   3. Customer claim topic (fallback when MCP has no clear signal)
+        # ────────────────────────────────────────────────────────────────────────
+
         primary_issue = "insufficient_evidence"
 
-        if payment_verdict == "duplicate_capture" or "duplicate_charge" in claim_topics:
+        # ── Payment-domain issues (resolved by payment MCP data) ──────────────
+        if payment_verdict == "duplicate_capture":
             primary_issue = "duplicate_charge"
             ranked_causes = [{"cause_code": "DUPLICATE_ACQUIRER_TRANSACTION", "rank": 1}]
             responsible_parties = [
@@ -51,25 +62,66 @@ class ConflictResolverAgent(BaseAgent):
             ]
             resolution_actions = ["issue_customer_refund", "reconcile_payment_gateway"]
 
-        elif payment_verdict == "refund_failed" or "refund_failed" in claim_topics:
+        elif payment_verdict == "refund_failed":
             primary_issue = "refund_failed"
             ranked_causes = [{"cause_code": "GATEWAY_REFUND_FAILURE", "rank": 1}]
             responsible_parties = [{"party_type": "payment_provider", "party_id": None}]
             resolution_actions = ["retrigger_refund_payment", "update_customer_status"]
 
-        elif payment_verdict == "refund_pending" or "refund_pending" in claim_topics:
+        elif payment_verdict == "refund_pending":
             primary_issue = "refund_pending"
             ranked_causes = [{"cause_code": "REFUND_CLEARING_IN_PROGRESS", "rank": 1}]
             responsible_parties = [{"party_type": "platform", "party_id": None}]
             resolution_actions = ["expedite_refund_settlement", "update_customer_status"]
 
-        elif payment_verdict == "capture_mismatch" or "payment_mismatch" in claim_topics:
+        elif payment_verdict == "capture_mismatch":
             primary_issue = "payment_mismatch"
             ranked_causes = [{"cause_code": "PARTIAL_CAPTURE_MISMATCH", "rank": 1}]
             responsible_parties = [{"party_type": "payment_provider", "party_id": None}]
             resolution_actions = ["reconcile_discrepancy_ledger", "notify_customer"]
 
-        elif "valid_split_payment" in claim_topics:
+        # ── Shipment-domain issues (resolved by shipment MCP data) ─────────────
+        elif shipment_verdict == "seller_delay":
+            primary_issue = "late_delivery_seller"
+            seller_id = late_sellers[0] if late_sellers else (affected_sellers[0] if affected_sellers else None)
+            ranked_causes = [{"cause_code": "SELLER_DISPATCH_OVERDUE", "rank": 1}]
+            responsible_parties = [{"party_type": "seller", "party_id": seller_id}]
+            resolution_actions = ["notify_seller_delay_penalty", "update_customer_status"]
+
+        elif shipment_verdict == "logistics_delay":
+            primary_issue = "late_delivery_logistics"
+            ranked_causes = [{"cause_code": "CARRIER_TRANSIT_DELAY", "rank": 1}]
+            responsible_parties = [{"party_type": "logistics_provider", "party_id": None}]
+            resolution_actions = ["contact_logistics_provider", "update_customer_status"]
+
+        # ── Claim-topic fallback (when MCP signals are inconclusive) ──────────
+        elif primary_claim_topic == "duplicate_charge":
+            primary_issue = "duplicate_charge"
+            ranked_causes = [{"cause_code": "DUPLICATE_ACQUIRER_TRANSACTION", "rank": 1}]
+            responsible_parties = [
+                {"party_type": "payment_provider", "party_id": affected_payments[0] if affected_payments else None}
+            ]
+            resolution_actions = ["issue_customer_refund", "reconcile_payment_gateway"]
+
+        elif primary_claim_topic == "refund_failed":
+            primary_issue = "refund_failed"
+            ranked_causes = [{"cause_code": "GATEWAY_REFUND_FAILURE", "rank": 1}]
+            responsible_parties = [{"party_type": "payment_provider", "party_id": None}]
+            resolution_actions = ["retrigger_refund_payment", "update_customer_status"]
+
+        elif primary_claim_topic == "refund_pending":
+            primary_issue = "refund_pending"
+            ranked_causes = [{"cause_code": "REFUND_CLEARING_IN_PROGRESS", "rank": 1}]
+            responsible_parties = [{"party_type": "platform", "party_id": None}]
+            resolution_actions = ["expedite_refund_settlement", "update_customer_status"]
+
+        elif primary_claim_topic == "payment_mismatch":
+            primary_issue = "payment_mismatch"
+            ranked_causes = [{"cause_code": "PARTIAL_CAPTURE_MISMATCH", "rank": 1}]
+            responsible_parties = [{"party_type": "payment_provider", "party_id": None}]
+            resolution_actions = ["reconcile_discrepancy_ledger", "notify_customer"]
+
+        elif primary_claim_topic == "valid_split_payment":
             primary_issue = "valid_split_payment"
             ranked_causes = [{"cause_code": "VALID_SPLIT_TENDER", "rank": 1}]
             responsible_parties = [{"party_type": "customer", "party_id": None}]
@@ -83,30 +135,38 @@ class ConflictResolverAgent(BaseAgent):
                 }
             )
 
-        elif shipment_verdict == "seller_delay" or "late_delivery_seller" in claim_topics:
+        elif primary_claim_topic == "late_delivery_seller":
             primary_issue = "late_delivery_seller"
             seller_id = late_sellers[0] if late_sellers else (affected_sellers[0] if affected_sellers else None)
             ranked_causes = [{"cause_code": "SELLER_DISPATCH_OVERDUE", "rank": 1}]
             responsible_parties = [{"party_type": "seller", "party_id": seller_id}]
             resolution_actions = ["notify_seller_delay_penalty", "update_customer_status"]
 
-        elif shipment_verdict == "logistics_delay" or "late_delivery_logistics" in claim_topics:
+        elif primary_claim_topic == "late_delivery_logistics":
             primary_issue = "late_delivery_logistics"
             ranked_causes = [{"cause_code": "CARRIER_TRANSIT_DELAY", "rank": 1}]
             responsible_parties = [{"party_type": "logistics_provider", "party_id": None}]
             resolution_actions = ["contact_logistics_provider", "update_customer_status"]
 
-        elif "canceled_order_paid" in claim_topics:
+        elif primary_claim_topic == "canceled_order_paid":
             primary_issue = "canceled_order_paid"
             ranked_causes = [{"cause_code": "ORDER_CANCELED_BEFORE_FULFILLMENT", "rank": 1}]
             responsible_parties = [{"party_type": "platform", "party_id": None}]
             resolution_actions = ["issue_customer_refund"]
 
-        elif "unavailable_order_paid" in claim_topics:
+        elif primary_claim_topic == "unavailable_order_paid":
             primary_issue = "unavailable_order_paid"
             ranked_causes = [{"cause_code": "INVENTORY_UNAVAILABLE_AFTER_PAYMENT", "rank": 1}]
-            responsible_parties = [{"party_type": "seller", "party_id": affected_sellers[0] if affected_sellers else None}]
+            responsible_parties = [
+                {"party_type": "seller", "party_id": affected_sellers[0] if affected_sellers else None}
+            ]
             resolution_actions = ["issue_customer_refund"]
+
+        elif primary_claim_topic == "unsupported_claim":
+            primary_issue = "unsupported_claim"
+            ranked_causes = [{"cause_code": "CLAIM_NOT_SUPPORTED_BY_EVIDENCE", "rank": 1}]
+            responsible_parties = [{"party_type": "customer", "party_id": None}]
+            resolution_actions = ["close_case_no_action"]
 
         else:
             primary_issue = "unsupported_claim"
@@ -114,7 +174,7 @@ class ConflictResolverAgent(BaseAgent):
             responsible_parties = [{"party_type": "customer", "party_id": None}]
             resolution_actions = ["close_case_no_action"]
 
-        # 3. Check for conflicts between claims and verified reality
+        # 3. Check for conflicts between claims and verified MCP reality
         if "late_delivery_logistics" in claim_topics and shipment_verdict == "seller_delay":
             data_conflicts.append(
                 {
@@ -145,9 +205,9 @@ class ConflictResolverAgent(BaseAgent):
                 }
             )
 
-        # 4. Secondary issues
+        # 4. Secondary issues: remaining substantive topics after primary
         secondary_issues = [
-            t for t in claim_topics if t != primary_issue and t != "requested_full_refund"
+            t for t in substantive_topics if t != primary_issue
         ][:10]
 
         return {

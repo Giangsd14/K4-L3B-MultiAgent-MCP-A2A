@@ -61,9 +61,11 @@ class PaymentSpecialistAgent(BaseAgent):
             except Exception:
                 pass
 
-        # 3. Analyze payments and refunds
+        # 3. Analyze payments and refunds from MCP data
         if payment_data:
-            payment_seqs: set[int] = set()
+            # Count unique payment_sequential values — duplicates only if the same sequential appears TWICE
+            payment_seq_to_records: dict[int, int] = {}
+            payment_types: list[str] = []
             is_duplicate = False
             is_split = False
 
@@ -75,17 +77,29 @@ class PaymentSpecialistAgent(BaseAgent):
                 amount = float(rec.get("payment_value", 0.0) or rec.get("amount", 0.0))
                 captured_total_brl += amount
 
-                seq = rec.get("payment_sequential", 1)
-                if seq in payment_seqs:
-                    is_duplicate = True
-                payment_seqs.add(seq)
+                # Correct duplicate detection: same (order_id, payment_sequential, amount) repeated
+                seq = rec.get("payment_sequential")
+                if seq is not None:
+                    payment_seq_to_records[seq] = payment_seq_to_records.get(seq, 0) + 1
+                    if payment_seq_to_records[seq] > 1:
+                        # Same sequential appeared more than once → true duplicate
+                        is_duplicate = True
 
-                pay_type = rec.get("payment_type")
-                if len(payment_seqs) > 1 or pay_type == "voucher":
-                    is_split = True
+                pay_type = rec.get("payment_type", "")
+                payment_types.append(pay_type)
+
+            # Split payment: multiple distinct payment_types (e.g., credit_card + voucher)
+            unique_pay_types = set(payment_types) - {""}
+            if len(unique_pay_types) > 1:
+                is_split = True
+            # Also: if more than one sequential value (multiple methods)
+            unique_seqs = set(payment_seq_to_records.keys())
+            if len(unique_seqs) > 1:
+                is_split = True
 
             captured_total_brl = round(captured_total_brl, 2)
 
+            # Compute refunds from MCP
             for ref_rec in refund_data:
                 ref_amt = float(ref_rec.get("refund_amount_brl", 0.0) or ref_rec.get("amount", 0.0))
                 refunded_total_brl += ref_amt
@@ -93,30 +107,40 @@ class PaymentSpecialistAgent(BaseAgent):
             refunded_total_brl = round(refunded_total_brl, 2)
             refundable_total_brl = round(max(0.0, captured_total_brl - refunded_total_brl), 2)
 
-            # Determine verdict
-            if is_duplicate or "duplicate_charge" in claim_topics:
+            if is_duplicate or ("duplicate_charge" in claim_topics and not is_split):
+                # Duplicate capture detected
                 verdict = "duplicate_capture"
                 dup_amount = round(captured_total_brl / 2.0, 2) if captured_total_brl > 0 else 50.0
                 recommended_refund_brl = min(dup_amount, refundable_total_brl)
-                refund_lines.append(
-                    {
-                        "reason_code": "duplicate_charge_reversal",
-                        "amount_brl": recommended_refund_brl,
-                        "entity_id": affected_payment_references[0] if affected_payment_references else None,
-                    }
-                )
-            elif "refund_pending" in claim_topics:
-                verdict = "refund_pending"
-                recommended_refund_brl = refundable_total_brl
                 if recommended_refund_brl > 0:
                     refund_lines.append(
                         {
-                            "reason_code": "pending_refund_settlement",
+                            "reason_code": "duplicate_charge_reversal",
                             "amount_brl": recommended_refund_brl,
                             "entity_id": affected_payment_references[0] if affected_payment_references else None,
                         }
                     )
+            elif refunded_total_brl > 0 and refundable_total_brl == 0:
+                # Already fully refunded
+                verdict = "refunded"
+                recommended_refund_brl = 0.0
+            elif refunded_total_brl > 0 and refundable_total_brl > 0 and "refund_pending" in claim_topics:
+                # Partial refund still pending
+                verdict = "refund_pending"
+                recommended_refund_brl = refundable_total_brl
+                refund_lines.append(
+                    {
+                        "reason_code": "pending_refund_settlement",
+                        "amount_brl": recommended_refund_brl,
+                        "entity_id": affected_payment_references[0] if affected_payment_references else None,
+                    }
+                )
+            elif is_split and "valid_split_payment" in claim_topics:
+                # Split tender is valid — no issue
+                verdict = "reconciled"
+                recommended_refund_brl = 0.0
             elif "refund_failed" in claim_topics:
+                # Refund was supposed to happen but failed
                 verdict = "refund_failed"
                 recommended_refund_brl = refundable_total_brl
                 if recommended_refund_brl > 0:
@@ -127,17 +151,23 @@ class PaymentSpecialistAgent(BaseAgent):
                             "entity_id": affected_payment_references[0] if affected_payment_references else None,
                         }
                     )
-            elif is_split and "valid_split_payment" in claim_topics:
-                verdict = "reconciled"
-                recommended_refund_brl = 0.0
+            elif "refund_pending" in claim_topics and refundable_total_brl > 0:
+                verdict = "refund_pending"
+                recommended_refund_brl = refundable_total_brl
+                refund_lines.append(
+                    {
+                        "reason_code": "pending_refund_settlement",
+                        "amount_brl": recommended_refund_brl,
+                        "entity_id": affected_payment_references[0] if affected_payment_references else None,
+                    }
+                )
             elif "payment_mismatch" in claim_topics:
                 verdict = "capture_mismatch"
                 recommended_refund_brl = 0.0
-            elif refunded_total_brl >= captured_total_brl and captured_total_brl > 0:
-                verdict = "refunded"
-                recommended_refund_brl = 0.0
             else:
+                # Payment is reconciled
                 verdict = "reconciled"
+                recommended_refund_brl = 0.0
 
         # 4. Fallback inference if MCP payment records are unavailable
         if verdict is None:
@@ -187,10 +217,8 @@ class PaymentSpecialistAgent(BaseAgent):
                 captured_total_brl = 120.0
                 refundable_total_brl = 0.0
                 recommended_refund_brl = 0.0
-            elif any("late_delivery" in t for t in claim_topics):
+            elif any("late_delivery" in t or "canceled" in t or "unavailable" in t for t in claim_topics):
                 verdict = "reconciled"
-                captured_total_brl = 100.0
-                refundable_total_brl = 100.0
                 recommended_refund_brl = 0.0
             else:
                 verdict = "reconciled"

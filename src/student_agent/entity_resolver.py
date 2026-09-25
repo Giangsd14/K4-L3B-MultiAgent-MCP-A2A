@@ -48,24 +48,27 @@ class EntityResolverAgent(BaseAgent):
         for candidate in candidate_order_ids:
             if not isinstance(candidate, str):
                 continue
-            if valid_orders_from_history:
-                if candidate in valid_orders_from_history:
+            # A candidate is valid if:
+            # (a) It matches the customer's claimed order, OR
+            # (b) It's confirmed in customer history, OR
+            # (c) It's a real 32-hex ID (not a synthetic "candidate-xxx")
+            is_claimed = claimed_order_id and candidate == claimed_order_id
+            in_history = candidate in valid_orders_from_history
+            is_real_hex = HEX32_PATTERN.match(candidate)
+
+            if is_claimed or in_history:
+                if candidate not in resolved_orders:
                     resolved_orders.append(candidate)
-                else:
-                    rejected_candidates.append(candidate)
-            elif claimed_order_id and candidate == claimed_order_id:
-                resolved_orders.append(candidate)
-            elif HEX32_PATTERN.match(candidate):
-                # Try verifying with get_order if candidate looks like a real 32-hex hash
-                if not resolved_orders:
-                    try:
-                        await self.call_tool("get_order", case_id=case_id, order_id=candidate)
-                        resolved_orders.append(candidate)
-                    except Exception:
-                        resolved_orders.append(candidate)
-                else:
-                    rejected_candidates.append(candidate)
+            elif is_real_hex:
+                # Verify with get_order to add evidence; accept regardless (API confirms it's real data)
+                try:
+                    await self.call_tool("get_order", case_id=case_id, order_id=candidate)
+                except Exception:
+                    pass
+                if candidate not in resolved_orders:
+                    resolved_orders.append(candidate)
             else:
+                # Synthetic "candidate-xxx" placeholders → rejected
                 rejected_candidates.append(candidate)
 
         # 3. Deduplicate

@@ -112,7 +112,11 @@ class VerifierAgent:
         assessment = validated.get("assessment", {})
         primary_issue = assessment.get("primary_issue", "insufficient_evidence")
         secondary_issues = list(dict.fromkeys(assessment.get("secondary_issues", [])))[:10]
+        # Keep case_status from coordinator (evidence-driven); only override if obviously wrong
         case_status = assessment.get("case_status", "no_action" if rec_refund == 0.0 else "action_required")
+        # If there's a recommended refund but status says no_action → override to action_required
+        if rec_refund > 0.0 and case_status == "no_action":
+            case_status = "action_required"
 
         resolution_actions = list(dict.fromkeys(validated.get("resolution_actions", [])))[:8]
         if case_status == "action_required" and not resolution_actions:
@@ -122,9 +126,6 @@ class VerifierAgent:
                 resolution_actions.append("notify_seller_delay_penalty")
             if not resolution_actions:
                 resolution_actions.append("update_customer_status")
-        elif case_status == "no_action":
-            # If no action, remove action demands
-            resolution_actions = [a for a in resolution_actions if "refund" not in a.lower()]
 
         # Root cause alignment with shipment/payment findings
         root_cause = validated.get("root_cause_analysis", {})
@@ -147,12 +148,33 @@ class VerifierAgent:
         validated["resolution_actions"] = resolution_actions
 
         # 7. Calibration of Confidence
+        # Start with base confidence from assessment, then adjust by evidence quality signals
         confidence = float(assessment.get("confidence", 0.85))
-        if len(validated["evidence_refs"]) < 2:
+        ev_count = len(validated["evidence_refs"])
+        conflict_count = len(validated.get("data_conflicts", []))
+
+        # Reward rich evidence
+        if ev_count >= 6:
+            confidence = min(1.0, confidence + 0.05)
+        elif ev_count < 2:
             confidence = min(confidence, 0.60)
-        if primary_issue == "insufficient_evidence":
+        elif ev_count < 4:
+            confidence = min(confidence, 0.75)
+
+        # Penalize conflicts — data contradictions reduce certainty
+        if conflict_count > 0:
+            confidence = min(confidence, 0.80 - 0.05 * conflict_count)
+
+        # Low confidence for vague primary issues
+        if primary_issue in ("insufficient_evidence", "unsupported_claim"):
             confidence = min(confidence, 0.40)
-        confidence = max(0.10, min(1.0, round(confidence, 2)))
+
+        # Penalize incomplete timeline
+        shipment = validated.get("shipment_analysis", {})
+        if not shipment.get("timeline_complete", True):
+            confidence = min(confidence, 0.78)
+
+        confidence = max(0.10, min(0.95, round(confidence, 2)))
 
         validated["assessment"] = {
             "primary_issue": primary_issue,

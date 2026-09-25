@@ -105,13 +105,28 @@ class MultiAgentCoordinator:
         )
 
         # 4. Construct Intermediate Output
+        primary_issue = conflict_result.get("primary_issue", "insufficient_evidence")
+        resolution_actions = conflict_result.get("resolution_actions", [])
+        recommended_refund = payment_result.get("recommended_refund_brl", 0.0)
+
+        # case_status: action_required when there's a refund to issue or concrete actions needed
+        _no_action_issues = {"unsupported_claim", "insufficient_evidence", "valid_split_payment"}
+        _action_verbs = {"issue_customer_refund", "retrigger_refund_payment", "expedite_refund_settlement",
+                         "notify_seller_delay_penalty", "contact_logistics_provider", "reconcile_discrepancy_ledger",
+                         "retrigger_refund_payment", "reconcile_payment_gateway"}
+        has_actionable = any(a in _action_verbs for a in resolution_actions)
+        if primary_issue in _no_action_issues or (recommended_refund == 0.0 and not has_actionable):
+            case_status = "no_action"
+        else:
+            case_status = "action_required"
+
         intermediate_output: dict[str, Any] = {
             "schema_version": "day09-l3b-output-v2",
             "case_id": case_id,
             "assessment": {
-                "primary_issue": conflict_result.get("primary_issue", "insufficient_evidence"),
+                "primary_issue": primary_issue,
                 "secondary_issues": conflict_result.get("secondary_issues", []),
-                "case_status": "no_action",
+                "case_status": case_status,
                 "confidence": 0.85,
             },
             "affected_entities": {
