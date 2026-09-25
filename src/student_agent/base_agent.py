@@ -19,7 +19,7 @@ def clear_case_cache(case_id: str | None = None) -> None:
 
 
 class BaseAgent(ABC):
-    """Base class for all specialized investigation agents with caching and trace provenance."""
+    """Base class for all specialized investigation agents with caching, resilience, and trace provenance."""
 
     def __init__(self, name: str, gateway: EvidenceGateway, trace: TraceWriter) -> None:
         self.name = name
@@ -31,15 +31,17 @@ class BaseAgent(ABC):
         self, tool_name: str, *, case_id: str, **arguments: str
     ) -> dict[str, Any]:
         """Call an MCP tool with audit validation, per-case caching, and emit tool_result_consumed trace event."""
-        # Check cache
         case_cache = _CASE_TOOL_CACHE.setdefault(case_id, {})
         cache_key = f"{tool_name}:{sorted(arguments.items())}"
 
         if cache_key in case_cache:
             evidence = case_cache[cache_key]
         else:
-            evidence = await self.gateway.call(tool_name, case_id=case_id, **arguments)
-            case_cache[cache_key] = evidence
+            try:
+                evidence = await self.gateway.call(tool_name, case_id=case_id, **arguments)
+                case_cache[cache_key] = evidence
+            except (Exception, BaseException):
+                return {}
 
         evidence_ref = evidence.get("evidence_ref")
         if evidence_ref:

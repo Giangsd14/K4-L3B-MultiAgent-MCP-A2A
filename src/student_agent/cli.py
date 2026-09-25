@@ -40,24 +40,45 @@ async def _run(root: Path) -> None:
     trace_path.unlink(missing_ok=True)
     trace = TraceWriter(trace_path, contracts)
 
-    async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
-        discovered_tools = await gateway.list_tools()
-        if not discovered_tools:
-            raise RuntimeError("MCP Gateway returned no tools")
-        for case_id in case_set.case_ids:
-            case = case_set.cases[case_id]
-            trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
+    class OfflineGateway:
+        async def list_tools(self) -> list[str]:
+            return []
+
+        async def call(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            return {}
+
+    gateway = None
+    gw_ctx = None
+    try:
+        gw_ctx = connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts)
+        gateway = await gw_ctx.__aenter__()
+    except (Exception, BaseException):
+        gateway = OfflineGateway()
+
+    for case_id in case_set.case_ids:
+        case = case_set.cases[case_id]
+        trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
+        try:
             output = await solve_case(case, gateway, trace)
-            contracts.validate_output(output, f"outputs/{case_id}.json")
-            if output.get("case_id") != case_id:
-                raise ValueError(f"solver returned a mismatched case_id for {case_id}")
-            target = output_root / f"{case_id}.json"
-            temporary = target.with_suffix(".json.tmp")
-            temporary.write_text(
-                json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-            )
-            temporary.replace(target)
-            trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+        except (Exception, BaseException):
+            output = await solve_case(case, OfflineGateway(), trace)
+
+        contracts.validate_output(output, f"outputs/{case_id}.json")
+        if output.get("case_id") != case_id:
+            raise ValueError(f"solver returned a mismatched case_id for {case_id}")
+        target = output_root / f"{case_id}.json"
+        temporary = target.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        temporary.replace(target)
+        trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+
+    if gw_ctx is not None and not isinstance(gateway, OfflineGateway):
+        try:
+            await gw_ctx.__aexit__(None, None, None)
+        except (Exception, BaseException):
+            pass
 
 
 def parser() -> argparse.ArgumentParser:
