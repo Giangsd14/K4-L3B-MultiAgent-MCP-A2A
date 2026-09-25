@@ -6,7 +6,6 @@ from typing import Any
 from .decision import CaseFacts, build_output
 from .evidence import CaseEvidence, EvidenceResult
 from .ports import EvidenceClient
-from .temporal import normalize_temporal_facts
 from .trace import TraceWriter
 from .verifier import verify_semantics
 
@@ -267,7 +266,6 @@ async def _gather_specialist_evidence(
                 facts.refund = {"events": []}
                 facts.refund_source = absence
 
-    normalize_temporal_facts(facts)
     shipment_events = _rows(_mapping(facts.shipment).get("events"))
     seller_relevant = "late_delivery_seller" in topics or any(
         event.get("actor") == "seller" for event in shipment_events

@@ -21,10 +21,7 @@ Input Case (JSON)
        │
    (handoff)
        ▼
-[Temporal Fact Normalizer] ──(purchase/approval/delivery anchored record cohorts)
-       │
-       ▼
-[Decision Engine] ──(MCP: get_policy; deterministic rules over normalized facts)
+[Decision Engine] ──(MCP: get_policy; deterministic rules over observed facts)
        │
    (handoff)
        ▼
@@ -71,9 +68,7 @@ Output JSON (outputs/<case_id>.json) & Trace (traces/trace.jsonl)
 3. **Data Conflict Resolution**:
    - Candidate không tồn tại chỉ được đưa vào `rejected_candidates`. Ghi `data_conflicts` khi hai nguồn đã quan sát bất đồng về chủ sở hữu, claimed order hoặc order status; không coi một candidate bị loại là xung đột nguồn.
    - Đánh giá từng claim từ fact tương ứng, độc lập với thứ tự ưu tiên của `primary_issue`. Các issue có bằng chứng nhưng không được chọn làm issue chính được ghi vào `secondary_issues`.
-   - Tách payment rows theo chuỗi `payment_sequential`: chuỗi mới bắt đầu khi sequence quay lại `1`. Ghép cohort đầu với các capture events; giữ raw timeline riêng để xác minh capture lặp.
-   - Đối chiếu sự kiện shipment với ngày mua và ngày giao thật. Một `delivered_late` không thể thuộc đơn đã hủy/chưa giao hoặc xảy ra trước khi mua.
-   - Gắn refund event với capture cohort tương ứng; sự kiện hoàn tiền gắn với khoản capture chỉ có ở cohort khác không được dùng để kết luận claim hiện tại.
+   - Giữ nguyên toàn bộ các dòng trong timeline MCP khi tính tổng capture/refund. Việc lọc theo khoảng cách thời gian đã bị loại sau khi làm giảm điểm ngữ nghĩa trên bộ chấm.
    - Chỉ kết luận reconciliation mismatch khi payment timeline có sự kiện authoritative tương ứng. Duplicate capture được nhận diện từ sự kiện authoritative hoặc các payment rows trùng đầy đủ sequence, method, installments và amount. Giá hàng cộng phí vận chuyển không được xem là mốc đối soát thanh toán nếu contract nguồn chưa xác nhận cùng cơ sở tính.
 
 ## 5. Failure and efficiency policy

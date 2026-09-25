@@ -16,7 +16,12 @@ def _repeated_payment_row(source: dict[str, Any] | None) -> bool:
         return False
     seen: set[tuple[str, str, str, str]] = set()
     for row in payments:
-        if not isinstance(row, dict) or row.get("payment_value") is None:
+        if (
+            not isinstance(row, dict)
+            or row.get("payment_value") is None
+            or row.get("payment_sequential") in (None, "")
+            or row.get("payment_type") in (None, "")
+        ):
             continue
         signature = tuple(
             str(row.get(key, ""))
@@ -55,7 +60,7 @@ def verify_semantics(output: dict[str, Any], facts: CaseFacts) -> None:
     if (
         payment_verdict == "duplicate_capture"
         and "duplicate_charge" not in payment_event_types
-        and not _repeated_payment_row(facts.payment_raw)
+        and not _repeated_payment_row(facts.payment)
     ):
         raise ValueError(f"{case_id}: duplicate capture lacks payment-timeline evidence")
     if issue == "payment_mismatch" and payment_verdict != "capture_mismatch":

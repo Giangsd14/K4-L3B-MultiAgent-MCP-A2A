@@ -34,11 +34,8 @@ class CaseFacts:
     products: list[dict[str, Any]] = field(default_factory=list)
     sellers: list[dict[str, Any]] = field(default_factory=list)
     shipment: dict[str, Any] | None = None
-    shipment_raw: dict[str, Any] | None = None
     payment: dict[str, Any] | None = None
-    payment_raw: dict[str, Any] | None = None
     refund: dict[str, Any] | None = None
-    refund_raw: dict[str, Any] | None = None
     refund_source: str = "unavailable"
     policy: dict[str, Any] | None = None
     conflicts: list[dict[str, Any]] = field(default_factory=list)
@@ -189,7 +186,7 @@ def _payment_finding(
 
     payments = _records(facts.payment.get("payments"))
     events = _records(facts.payment.get("events"))
-    raw_payments = _records(_dict(facts.payment_raw).get("payments"))
+    raw_payments = _records(_dict(facts.payment).get("payments"))
     duplicate_rows = _duplicate_payment_rows(raw_payments)
     order_status = _dict(facts.order).get("order_status")
     if payments:
@@ -262,7 +259,11 @@ def _duplicate_payment_rows(payments: list[dict[str, Any]]) -> bool:
     seen: set[tuple[str, str, str, Decimal]] = set()
     for payment in payments:
         amount = _first_known_amount(payment, "payment_value", "amount_brl")
-        if amount is None:
+        if (
+            amount is None
+            or payment.get("payment_sequential") in (None, "")
+            or payment.get("payment_type") in (None, "")
+        ):
             continue
         fingerprint = (
             str(payment.get("payment_sequential", "")),
@@ -304,9 +305,11 @@ def _primary_issue(
     if order_status in {"canceled", "unavailable"} and outstanding is not None and outstanding > 0:
         return f"{order_status}_order_paid", 0.86
     if (
-        "valid_split_payment" in claim_topics
-        and len(payments) > 1
+        len(payments) > 1
         and payment_verdict == "reconciled"
+        and claim_topics.intersection(
+            {"valid_split_payment", "duplicate_charge", "payment_mismatch"}
+        )
     ):
         return "valid_split_payment", 0.78
     if facts.refund is None and claim_topics.intersection(
@@ -321,8 +324,6 @@ def _primary_issue(
         return "insufficient_evidence", 0.4
     if facts.order is None or facts.payment is None or facts.shipment is None:
         return "insufficient_evidence", 0.4
-    if len(payments) > 1 and payment_verdict == "reconciled":
-        return "valid_split_payment", 0.78
     return "unsupported_claim", 0.72
 
 
@@ -442,11 +443,7 @@ def build_output(case: dict[str, Any], facts: CaseFacts, evidence: CaseEvidence)
     ):
         issue = first_topic
         confidence = 0.8
-    secondary_issues = [
-        supported
-        for supported in supported_issues
-        if supported != issue and supported != "valid_split_payment"
-    ][:10]
+    secondary_issues = [supported for supported in supported_issues if supported != issue][:10]
     if issue != first_topic:
         confidence = min(confidence, 0.7)
     refund_dependent_issue = issue in {
@@ -530,14 +527,7 @@ def build_output(case: dict[str, Any], facts: CaseFacts, evidence: CaseEvidence)
         customer_id = case.get("customer_unique_id_hint")
     related_orders = _ids(_records(history.get("orders")), "order_id")
 
-    reference_payments = (
-        _records(_dict(facts.payment_raw).get("payments"))
-        if payment_verdict == "duplicate_capture" and facts.payment_raw is not None
-        else payments
-    )
-    payment_refs = _payment_references(
-        reference_payments, _records(_dict(facts.payment).get("events"))
-    )
+    payment_refs = _payment_references(payments, _records(_dict(facts.payment).get("events")))
     shipment = _dict(facts.shipment)
     shipment_refs = _shipment_references(shipment, facts.order_id)
     item_ids = _ids(facts.items, "order_item_id", "item_id")

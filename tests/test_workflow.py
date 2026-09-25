@@ -324,6 +324,60 @@ def test_explicit_duplicate_evidence_overrides_conflicting_claim_topic(tmp_path:
     assert duplicate_claim["affected_entities"]["shipment_ids"] == ["shipment-actual"]
 
 
+def test_repeated_payment_rows_support_duplicate_charge_without_explicit_event(
+    tmp_path: Path,
+) -> None:
+    data = responses()
+    card = {
+        "payment_sequential": "1",
+        "payment_type": "credit_card",
+        "payment_installments": "1",
+        "payment_value": "64.00",
+    }
+    voucher = {
+        "payment_sequential": "2",
+        "payment_type": "voucher",
+        "payment_installments": "1",
+        "payment_value": "64.00",
+    }
+    data["get_payment_timeline"]["payments"] = [card, voucher, dict(card), dict(voucher)]
+    data["get_policy"]["rules"]["duplicate_charge"] = {
+        "case_status": "action_required",
+        "recommended_action": "refund_duplicate_charge",
+        "refund_brl": 64,
+    }
+
+    output = run_case(tmp_path, case("duplicate_charge"), FakeGateway(data))
+
+    assert output["payment_analysis"]["verdict"] == "duplicate_capture"
+    assert output["payment_analysis"]["captured_total_brl"] == 256
+    assert output["assessment"]["primary_issue"] == "duplicate_charge"
+    assert output["financial_resolution"]["recommended_refund_brl"] == 64
+
+
+def test_equal_split_amounts_are_not_a_duplicate_charge(tmp_path: Path) -> None:
+    data = responses()
+    data["get_payment_timeline"]["payments"] = [
+        {
+            "payment_sequential": "1",
+            "payment_type": "credit_card",
+            "payment_installments": "1",
+            "payment_value": "44.50",
+        },
+        {
+            "payment_sequential": "2",
+            "payment_type": "voucher",
+            "payment_installments": "1",
+            "payment_value": "44.50",
+        },
+    ]
+
+    output = run_case(tmp_path, case("valid_split_payment"), FakeGateway(data))
+
+    assert output["payment_analysis"]["verdict"] == "reconciled"
+    assert output["assessment"]["primary_issue"] == "valid_split_payment"
+
+
 def test_explicit_seller_delay_precedes_canceled_status(tmp_path: Path) -> None:
     data = responses()
     data["get_order"]["order-1"]["order_status"] = "canceled"
@@ -363,7 +417,7 @@ def test_semantic_verifier_rejects_unbacked_payment_mismatch(tmp_path: Path) -> 
         verify_semantics(output, CaseFacts(payment={"events": []}))
 
 
-def test_normal_split_is_not_a_secondary_issue_for_failed_refund(tmp_path: Path) -> None:
+def test_secondary_refund_issue_keeps_claim_assessment_independent(tmp_path: Path) -> None:
     data = responses()
     data["get_refund_timeline"] = {
         "events": [{"refund_id": "r1", "status": "failed", "amount_brl": 20}]
@@ -371,7 +425,7 @@ def test_normal_split_is_not_a_secondary_issue_for_failed_refund(tmp_path: Path)
     output = run_case(tmp_path, case("valid_split_payment"), FakeGateway(data))
 
     assert output["assessment"]["primary_issue"] == "refund_failed"
-    assert "valid_split_payment" not in output["assessment"]["secondary_issues"]
+    assert "valid_split_payment" in output["assessment"]["secondary_issues"]
     assert output["claim_assessments"][0]["verdict"] == "supported"
 
 
