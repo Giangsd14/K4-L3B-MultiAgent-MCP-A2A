@@ -40,7 +40,7 @@ class BaseAgent(ABC):
             try:
                 evidence = await self.gateway.call(tool_name, case_id=case_id, **arguments)
                 case_cache[cache_key] = evidence
-            except BaseException as _exc:
+            except BaseException:
                 # Covers both regular exceptions AND Python 3.11+ ExceptionGroup from AnyIO TaskGroups
                 return {}
 
